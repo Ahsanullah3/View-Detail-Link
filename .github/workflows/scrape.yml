@@ -1,0 +1,43 @@
+name: Scrape Agents
+
+on:
+  workflow_dispatch:
+    inputs:
+      start_row:
+        description: 'Starting row in Sheet1 column A'
+        required: false
+        default: '2'
+  schedule:
+    - cron: '0 */6 * * *'
+
+concurrency:
+  group: scrape-agents
+  cancel-in-progress: false
+
+jobs:
+  scrape:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Run scraper
+        env:
+          GOOGLE_SA_JSON: ${{ secrets.GOOGLE_SA_JSON }}
+          SHEET_ID: ${{ secrets.SHEET_ID }}
+          GITHUB_TOKEN: ${{ secrets.GH_PAT }}
+          START_ROW: ${{ github.event.inputs.start_row || '2' }}
+        run: python scraper.py
