@@ -4,19 +4,19 @@ on:
   workflow_dispatch:
     inputs:
       start_row:
-        description: 'Starting row in Sheet1 column A'
+        description: 'Starting row in Sheet1 column A (optional; 2 = from top)'
         required: false
         default: '2'
   schedule:
     - cron: '0 */6 * * *'
 
+permissions:
+  actions: write      # required for built-in GITHUB_TOKEN to dispatch workflow_dispatch
+  contents: read
+
 concurrency:
   group: scrape-agents
   cancel-in-progress: false
-
-permissions:
-  actions: write      # required so trigger_next_run() can dispatch the workflow
-  contents: read
 
 jobs:
   scrape:
@@ -41,13 +41,26 @@ jobs:
           playwright install-deps chromium
 
       - name: Verify imports
-        run: |
-          python -c "import bs4, gspread, curl_cffi, requests, stealthkit, playwright; print('imports OK')"
+        run: python -c "import bs4, gspread, curl_cffi, requests, stealthkit, playwright; print('imports OK')"
 
       - name: Run scraper
+        id: scrape
         env:
           GOOGLE_SA_JSON: ${{ secrets.GOOGLE_SA_JSON }}
           SHEET_ID: ${{ secrets.SHEET_ID }}
-          GITHUB_TOKEN: ${{ secrets.GH_PAT }}
           START_ROW: ${{ github.event.inputs.start_row || '2' }}
         run: python scraper.py
+
+      - name: Show scraper outputs
+        run: |
+          echo "has_more=${{ steps.scrape.outputs.has_more }}"
+          echo "next_start_row=${{ steps.scrape.outputs.next_start_row }}"
+
+      - name: Trigger next batch
+        if: steps.scrape.outputs.has_more == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          NEXT_ROW: ${{ steps.scrape.outputs.next_start_row }}
+        run: |
+          echo "Dispatching next run from row $NEXT_ROW"
+          gh workflow run scrape.yml --ref main -f start_row="$NEXT_ROW"
