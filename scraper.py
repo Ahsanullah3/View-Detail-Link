@@ -22,13 +22,14 @@ START_ROW = 2
 TARGET_SHEET = "Sheet2"
 START_COL_LETTER = "H"
 START_COL_INDEX = 8
+DONE_COL_INDEX = 8   # source_url column (H) in Sheet2 — used for skip check
 
 HEADERS = [
     "agent_name", "agent_slug", "agent_url",
     "agency_name", "agency_url",
     "sold_lead_agent", "median_sold_price",
     "median_days_on_market", "total_sales_all_suburbs",
-    "source_url", "error",
+    "source_url", "scraped_at", "error",
 ]
 END_COL_LETTER = gspread.utils.rowcol_to_a1(
     1, START_COL_INDEX + len(HEADERS) - 1
@@ -41,10 +42,10 @@ BASE = "https://view.com.au"
 def ts():
     return datetime.utcnow().strftime("%H:%M:%S")
 
-def log(m):     print(f"[{ts()}] {m}", flush=True)
-def log_ok(m):  print(f"[{ts()}] ✅ {m}", flush=True)
-def log_warn(m):print(f"[{ts()}] ⚠️  {m}", flush=True)
-def log_err(m): print(f"[{ts()}] ❌ {m}", flush=True)
+def log(m):      print(f"[{ts()}] {m}", flush=True)
+def log_ok(m):   print(f"[{ts()}] ✅ {m}", flush=True)
+def log_warn(m): print(f"[{ts()}] ⚠️  {m}", flush=True)
+def log_err(m):  print(f"[{ts()}] ❌ {m}", flush=True)
 
 def log_progress(done, total, label=""):
     pct = (done / total * 100) if total else 0
@@ -71,30 +72,28 @@ def _price(s):
     return m.group(0) if m else None
 
 def parse_agent_cards(html: str):
-    """Extract every [data-testid='agent-card'] block."""
     soup = BeautifulSoup(html, "html.parser")
     cards = soup.select('[data-testid="agent-card"]')
     records = []
     for card in cards:
-        # agency
         agency_a = card.select_one('[data-testid="agency-image"]')
         agency_url = _abs(agency_a["href"]) if agency_a and agency_a.has_attr("href") else ""
         agency_img = agency_a.find("img") if agency_a else None
         agency_name = agency_img.get("alt", "").strip() if agency_img else ""
 
-        # agent link wraps the body
         agent_a = card.find("a", href=re.compile(r"^/agent-profile/"))
         agent_url = _abs(agent_a["href"]) if agent_a else ""
         agent_slug = agent_url.rstrip("/").split("/")[-1] if agent_url else ""
 
-        # agent name = <h3>
         name_node = card.select_one("h3")
         agent_name = _text(name_node)
 
-        # stats: each metric lives in a div with a <p class="text-at-xl ..."> value
         stats = {}
         for block in card.select("div.flex.flex-col.gap-2"):
-            label = " ".join(_text(p) for p in block.find_all("p") if "text-at-xl" not in (p.get("class") or []))
+            label = " ".join(
+                _text(p) for p in block.find_all("p")
+                if "text-at-xl" not in (p.get("class") or [])
+            )
             value_p = block.find("p", class_=lambda c: c and "text-at-xl" in c)
             value = _text(value_p)
             if "Median sold price" in label:
@@ -168,14 +167,8 @@ async def scrape_batch(session, urls, offset, total):
     return await asyncio.gather(*tasks)
 
 
-def trigger_next_run(start_row):
-    token = os.environ["GITHUB_TOKEN"]
-    repo = os.environ["GITHUB_REPOSITORY"]
-    url = f"https://api.github.com/repos/{repo}/actions/workflows/scrape.yml/dispatches"
-    payload = {"ref": "main", "inputs": {"start_row": str(start_row)}}
-    headers = {"Authorization": f"Bearer {token}", "Accept": "application/vnd.github+json"}
-    r = requests.post(url, json=payload, headers=headers, timeout=30)
-    log(f"Triggered next run from row {start_row}: HTTP {r.status_code}")
+def get_gspread_client():
+    return gspread.service_account_from_dict(json.loads(os.environ["GOOGLE_SA_JSON"]))
 
 
 def get_or_create_target(sh):
@@ -186,49 +179,87 @@ def get_or_create_target(sh):
         return sh.add_worksheet(title=TARGET_SHEET, rows=1000, cols=30)
 
 
-def get_gspread_client():
-    return gspread.service_account_from_dict(json.loads(os.environ["GOOGLE_SA_JSON"]))
+def load_done_urls(target):
+    """Read column H of Sheet2 and return the set of source_urls already scraped."""
+    try:
+        col_h = target.col_values(DONE_COL_INDEX)  # 1-based index
+    except Exception as e:
+        log_warn(f"Could not read done URLs: {e}")
+        return set()
+    # Skip header (row 1)
+    return {u.strip() for u in col_h[1:] if u and u.strip()}
 
 
 def main():
     log("=" * 60); log("SCRAPER START"); log("=" * 60)
+
     gc = get_gspread_client()
     sh = gc.open_by_key(os.environ["SHEET_ID"])
     source = sh.worksheet(SOURCE_SHEET)
     target = get_or_create_target(sh)
 
     start_row = int(os.environ.get("START_ROW", str(START_ROW)))
+    log(f"START_ROW = {start_row}")
+
+    # ---- load done set BEFORE building batch ----
+    done_urls = load_done_urls(target)
+    log(f"Already-scraped URLs in {TARGET_SHEET} col H: {len(done_urls)}")
+
     col_a = source.col_values(SOURCE_COL)
-    all_rows = [(i, u.strip()) for i, u in enumerate(col_a, start=1)
-                if i >= start_row and u and u.strip()]
-    if not all_rows:
-        log_warn("No URLs."); return
+    log(f"Read {len(col_a)} cells from {SOURCE_SHEET}!A")
 
-    batch = all_rows[:MAX_URLS_PER_RUN]
-    remaining = len(all_rows) - len(batch)
-    log(f"URLs available={len(all_rows)} processing={len(batch)} remaining={remaining}")
+    pending = []
+    skipped = 0
+    for i, u in enumerate(col_a, start=1):
+        if i < start_row:
+            continue
+        u = (u or "").strip()
+        if not u:
+            continue
+        if u in done_urls:
+            skipped += 1
+            continue
+        pending.append((i, u))
 
+    log(f"Pending URLs: {len(pending)} | Skipped (already done): {skipped}")
+
+    if not pending:
+        log_ok("Nothing to scrape — all URLs already done.")
+        # Write outputs so workflow knows to stop
+        _write_github_output(has_more=False, next_start_row="")
+        return
+
+    batch = pending[:MAX_URLS_PER_RUN]
+    remaining = len(pending) - len(batch)
+    log(f"Processing this run: {len(batch)} | Remaining after: {remaining}")
+
+    # Headers
     target.update(f"{START_COL_LETTER}1:{END_COL_LETTER}1", [HEADERS])
+    log_ok(f"Headers written to {TARGET_SHEET}!{START_COL_LETTER}1:{END_COL_LETTER}1")
+
     existing = target.col_values(START_COL_INDEX)
     next_write_row = max(len(existing) + 1, 2)
-    log(f"Appending at {TARGET_SHEET}!{START_COL_LETTER}{next_write_row}")
+    log(f"Will append starting at {TARGET_SHEET}!{START_COL_LETTER}{next_write_row}")
 
-    stats = {"done":0,"ok":0,"fail":0,"agents":0,"rows":0,"t0":time.time()}
+    stats = {"done": 0, "ok": 0, "fail": 0, "agents": 0, "rows": 0, "t0": time.time()}
 
     async def run():
         nonlocal next_write_row
         async with AsyncSession() as session:
             total = len(batch)
             for i in range(0, len(batch), 30):
-                sub = batch[i:i+30]
+                sub = batch[i:i + 30]
                 urls = [u for _, u in sub]
-                log(""); log(f"--- BATCH {i//30+1} ({len(sub)} URLs) ---")
+                log("")
+                log(f"--- BATCH {i // 30 + 1} ({len(sub)} URLs) ---")
                 results = await scrape_batch(session, urls, offset=i, total=total)
 
                 flat = []
+                now = datetime.utcnow().isoformat(timespec="seconds") + "Z"
                 for (_, url), recs in zip(sub, results):
                     for rec in recs:
                         rec["source_url"] = url
+                        rec["scraped_at"] = now
                         flat.append([rec.get(h, "") for h in HEADERS])
                     if recs and recs[0].get("error"):
                         stats["fail"] += 1
@@ -247,12 +278,14 @@ def main():
                     log_ok(f"Wrote {len(flat)} rows -> H{next_write_row}:{END_COL_LETTER}{end_row}")
                     next_write_row = end_row + 1
                 else:
-                    log_warn("No rows to write")
+                    log_warn("No rows to write for this batch")
 
                 log_progress(stats["done"], total, "URLs done")
-                log(f"  totals ok={stats['ok']} failed={stats['fail']} agents={stats['agents']} rows={stats['rows']}")
+                log(f"  totals ok={stats['ok']} failed={stats['fail']} "
+                    f"agents={stats['agents']} rows={stats['rows']}")
 
                 if i + 30 < len(batch):
+                    log(f"Sleeping {BATCH_PAUSE}s...")
                     time.sleep(BATCH_PAUSE)
 
     asyncio.run(run())
@@ -265,11 +298,27 @@ def main():
     log(f"Next write row: {TARGET_SHEET}!{START_COL_LETTER}{next_write_row}")
     log(f"Remaining URLs: {remaining}")
 
+    # ---- decide whether to chain ----
     if remaining > 0:
-        trigger_next_run(batch[-1][0] + 1)
+        next_start_row = batch[-1][0] + 1
+        log(f"More work remaining -> next_start_row={next_start_row}")
+        _write_github_output(has_more=True, next_start_row=str(next_start_row))
     else:
-        log_ok("All URLs processed.")
+        log_ok("All pending URLs processed. No further trigger needed.")
+        _write_github_output(has_more=False, next_start_row="")
+
     log("=" * 60)
+
+
+def _write_github_output(has_more: bool, next_start_row: str):
+    path = os.environ.get("GITHUB_OUTPUT")
+    if not path:
+        return
+    with open(path, "a") as f:
+        f.write(f"has_more={'true' if has_more else 'false'}\n")
+        if next_start_row:
+            f.write(f"next_start_row={next_start_row}\n")
+    log(f"Wrote GITHUB_OUTPUT: has_more={has_more} next_start_row={next_start_row or '-'}")
 
 
 if __name__ == "__main__":
