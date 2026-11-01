@@ -22,7 +22,7 @@ START_ROW = 2
 TARGET_SHEET = "Sheet2"
 START_COL_LETTER = "H"
 START_COL_INDEX = 8
-DONE_COL_INDEX = 8   # source_url column (H) in Sheet2 — used for skip check
+DONE_COL_INDEX = 8
 
 HEADERS = [
     "agent_name", "agent_slug", "agent_url",
@@ -38,10 +38,7 @@ END_COL_LETTER = gspread.utils.rowcol_to_a1(
 BASE = "https://view.com.au"
 
 
-# ---------- logging ----------
-def ts():
-    return datetime.utcnow().strftime("%H:%M:%S")
-
+def ts(): return datetime.utcnow().strftime("%H:%M:%S")
 def log(m):      print(f"[{ts()}] {m}", flush=True)
 def log_ok(m):   print(f"[{ts()}] ✅ {m}", flush=True)
 def log_warn(m): print(f"[{ts()}] ⚠️  {m}", flush=True)
@@ -54,22 +51,17 @@ def log_progress(done, total, label=""):
     print(f"[{ts()}] [{bar}] {done}/{total} ({pct:.1f}%) {label}", flush=True)
 
 
-# ---------- parsing ----------
-def _text(node):
-    return node.get_text(strip=True) if node else ""
-
+def _text(node): return node.get_text(strip=True) if node else ""
 def _abs(href):
-    if not href:
-        return ""
+    if not href: return ""
     return href if href.startswith("http") else BASE + href
-
 def _int(s):
     m = re.search(r"[\d,]+", s or "")
     return int(m.group(0).replace(",", "")) if m else None
-
 def _price(s):
     m = re.search(r"\$[\d,]+", s or "")
     return m.group(0) if m else None
+
 
 def parse_agent_cards(html: str):
     soup = BeautifulSoup(html, "html.parser")
@@ -176,18 +168,34 @@ def get_or_create_target(sh):
         return sh.worksheet(TARGET_SHEET)
     except gspread.WorksheetNotFound:
         log_warn(f"Creating '{TARGET_SHEET}'...")
-        return sh.add_worksheet(title=TARGET_SHEET, rows=1000, cols=30)
+        return sh.add_worksheet(title=TARGET_SHEET, rows=2000, cols=30)
+
+
+def ensure_rows(target, needed: int):
+    if needed > target.row_count:
+        new_rows = max(needed + 500, target.row_count * 2)
+        log_warn(f"Resizing {TARGET_SHEET}: {target.row_count} -> {new_rows} rows")
+        target.resize(rows=new_rows)
 
 
 def load_done_urls(target):
-    """Read column H of Sheet2 and return the set of source_urls already scraped."""
     try:
-        col_h = target.col_values(DONE_COL_INDEX)  # 1-based index
+        col_h = target.col_values(DONE_COL_INDEX)
     except Exception as e:
         log_warn(f"Could not read done URLs: {e}")
         return set()
-    # Skip header (row 1)
     return {u.strip() for u in col_h[1:] if u and u.strip()}
+
+
+def _write_github_output(has_more: bool, next_start_row: str):
+    path = os.environ.get("GITHUB_OUTPUT")
+    if not path:
+        return
+    with open(path, "a") as f:
+        f.write(f"has_more={'true' if has_more else 'false'}\n")
+        if next_start_row:
+            f.write(f"next_start_row={next_start_row}\n")
+    log(f"Wrote GITHUB_OUTPUT: has_more={has_more} next_start_row={next_start_row or '-'}")
 
 
 def main():
@@ -198,24 +206,25 @@ def main():
     source = sh.worksheet(SOURCE_SHEET)
     target = get_or_create_target(sh)
 
+    # Ensure header row fits before touching anything
+    ensure_rows(target, 2)
+    if target.col_count < START_COL_INDEX + len(HEADERS):
+        target.resize(rows=target.row_count, cols=START_COL_INDEX + len(HEADERS))
+
     start_row = int(os.environ.get("START_ROW", str(START_ROW)))
     log(f"START_ROW = {start_row}")
 
-    # ---- load done set BEFORE building batch ----
     done_urls = load_done_urls(target)
     log(f"Already-scraped URLs in {TARGET_SHEET} col H: {len(done_urls)}")
 
     col_a = source.col_values(SOURCE_COL)
     log(f"Read {len(col_a)} cells from {SOURCE_SHEET}!A")
 
-    pending = []
-    skipped = 0
+    pending, skipped = [], 0
     for i, u in enumerate(col_a, start=1):
-        if i < start_row:
-            continue
+        if i < start_row: continue
         u = (u or "").strip()
-        if not u:
-            continue
+        if not u: continue
         if u in done_urls:
             skipped += 1
             continue
@@ -225,7 +234,6 @@ def main():
 
     if not pending:
         log_ok("Nothing to scrape — all URLs already done.")
-        # Write outputs so workflow knows to stop
         _write_github_output(has_more=False, next_start_row="")
         return
 
@@ -233,18 +241,14 @@ def main():
     remaining = len(pending) - len(batch)
     log(f"Processing this run: {len(batch)} | Remaining after: {remaining}")
 
-    # Headers
+    # Ensure header exists
+    ensure_rows(target, 1)
     target.update(f"{START_COL_LETTER}1:{END_COL_LETTER}1", [HEADERS])
     log_ok(f"Headers written to {TARGET_SHEET}!{START_COL_LETTER}1:{END_COL_LETTER}1")
-
-    existing = target.col_values(START_COL_INDEX)
-    next_write_row = max(len(existing) + 1, 2)
-    log(f"Will append starting at {TARGET_SHEET}!{START_COL_LETTER}{next_write_row}")
 
     stats = {"done": 0, "ok": 0, "fail": 0, "agents": 0, "rows": 0, "t0": time.time()}
 
     async def run():
-        nonlocal next_write_row
         async with AsyncSession() as session:
             total = len(batch)
             for i in range(0, len(batch), 30):
@@ -269,14 +273,10 @@ def main():
                     stats["agents"] += len(recs)
 
                 if flat:
-                    end_row = next_write_row + len(flat) - 1
-                    target.update(
-                        f"{START_COL_LETTER}{next_write_row}:{END_COL_LETTER}{end_row}",
-                        flat, value_input_option="RAW",
-                    )
+                    # append_rows auto-grows the sheet — no manual sizing needed
+                    target.append_rows(flat, value_input_option="RAW")
                     stats["rows"] += len(flat)
-                    log_ok(f"Wrote {len(flat)} rows -> H{next_write_row}:{END_COL_LETTER}{end_row}")
-                    next_write_row = end_row + 1
+                    log_ok(f"Appended {len(flat)} rows to {TARGET_SHEET}")
                 else:
                     log_warn("No rows to write for this batch")
 
@@ -295,10 +295,8 @@ def main():
     log(f"Elapsed: {elapsed:.1f}s")
     log(f"URLs: {stats['done']}/{len(batch)}  ok={stats['ok']} failed={stats['fail']}")
     log(f"Agents extracted: {stats['agents']}  rows written: {stats['rows']}")
-    log(f"Next write row: {TARGET_SHEET}!{START_COL_LETTER}{next_write_row}")
     log(f"Remaining URLs: {remaining}")
 
-    # ---- decide whether to chain ----
     if remaining > 0:
         next_start_row = batch[-1][0] + 1
         log(f"More work remaining -> next_start_row={next_start_row}")
@@ -308,17 +306,6 @@ def main():
         _write_github_output(has_more=False, next_start_row="")
 
     log("=" * 60)
-
-
-def _write_github_output(has_more: bool, next_start_row: str):
-    path = os.environ.get("GITHUB_OUTPUT")
-    if not path:
-        return
-    with open(path, "a") as f:
-        f.write(f"has_more={'true' if has_more else 'false'}\n")
-        if next_start_row:
-            f.write(f"next_start_row={next_start_row}\n")
-    log(f"Wrote GITHUB_OUTPUT: has_more={has_more} next_start_row={next_start_row or '-'}")
 
 
 if __name__ == "__main__":
